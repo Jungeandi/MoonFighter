@@ -1,0 +1,1047 @@
+``html
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shadow Duel</title>
+    <style>
+         {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #0a0a0a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        #gameContainer {
+            position: relative;
+            border: 3px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 0 30px rgba(255, 100, 50, 0.3);
+        }
+        canvas {
+            display: block;
+        }
+        #controls {
+            position: absolute;
+            bottom: -60px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        <div id="controls">
+            A/D: Bewegung | W: Springen | S: Ducken | J: Leicht | K: Schwer | L: Block
+        </div>
+    </div>
+
+    <script>
+        // ==================== KONFIGURATION ====================
+        const CONFIG = {
+            WIDTH: 1000,
+            HEIGHT: 600,
+            GROUNDY: 500,
+            GRAVITY: 0.8,
+            FRICTION: 0.85,
+            PLAYERSPEED: 6,
+            JUMPFORCE: -18,
+            LIGHTDAMAGE: 8,
+            HEAVYDAMAGE: 18,
+            BLOCKREDUCTION: 0.3,
+            CRITCHANCE: 0.12,
+            CRITMULTIPLIER: 1.8,
+            HITSTUN: 12,
+            KNOCKBACKLIGHT: 8,
+            KNOCKBACKHEAVY: 16,
+            FREEZEFRAMESLIGHT: 3,
+            FREEZEFRAMESHEAVY: 6,
+            SHAKEINTENSITY: 8,
+            SHAKEDURATION: 8
+        };
+
+        // ==================== AUDIO SYSTEM ====================
+        class AudioManager {
+            constructor() {
+                this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            playHit(heavy = false) {
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                const filter = this.ctx.createBiquadFilter();
+                
+                osc.connect(filter);
+                filter.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                filter.type = 'lowpass';
+                filter.frequency.value = heavy ? 200 : 400;
+                
+                osc.type = 'sawtooth';
+                osc.frequency.value = heavy ? 80 : 150;
+                
+                gain.gain.setValueAtTime(0.4, this.ctx.currentTime);
+                gain.gain.exponentialDecayTo = (v, t) => gain.gain.exponentialRampToValueAtTime(v, t);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + (heavy ? 0.15 : 0.08));
+                
+                osc.start();
+                osc.stop(this.ctx.currentTime + 0.2);
+            }
+
+            playBlock() {
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                
+                osc.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                osc.type = 'square';
+                osc.frequency.value = 300;
+                
+                gain.gain.setValueAtTime(0.2, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
+                
+                osc.start();
+                osc.stop(this.ctx.currentTime + 0.1);
+            }
+
+            playWhoosh() {
+                const noise = this.ctx.createBufferSource();
+                const buffer = this.ctx.createBuffer(1, this.ctx.sampleRate  0.1, this.ctx.sampleRate);
+                const data = buffer.getChannelData(0);
+                
+                for (let i = 0; i < data.length; i++) {
+                    data[i] = (Math.random()  2 - 1)  (1 - i / data.length);
+                }
+                
+                noise.buffer = buffer;
+                const filter = this.ctx.createBiquadFilter();
+                filter.type = 'bandpass';
+                filter.frequency.value = 1000;
+                
+                const gain = this.ctx.createGain();
+                gain.gain.value = 0.15;
+                
+                noise.connect(filter);
+                filter.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                noise.start();
+            }
+
+            playKO() {
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                
+                osc.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(400, this.ctx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(50, this.ctx.currentTime + 0.5);
+                
+                gain.gain.setValueAtTime(0.3, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.5);
+                
+                osc.start();
+                osc.stop(this.ctx.currentTime + 0.6);
+            }
+
+            playVictory() {
+                const notes = [523, 659, 784, 1047];
+                notes.forEach((freq, i) => {
+                    setTimeout(() => {
+                        const osc = this.ctx.createOscillator();
+                        const gain = this.ctx.createGain();
+                        osc.connect(gain);
+                        gain.connect(this.ctx.destination);
+                        osc.type = 'sine';
+                        osc.frequency.value = freq;
+                        gain.gain.setValueAtTime(0.2, this.ctx.currentTime);
+                        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.3);
+                        osc.start();
+                        osc.stop(this.ctx.currentTime + 0.35);
+                    }, i  150);
+                });
+            }
+        }
+
+        // ==================== PARTIKEL SYSTEM ====================
+        class Particle {
+            constructor(x, y, color, velocityX, velocityY, size, life) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                this.vx = velocityX;
+                this.vy = velocityY;
+                this.size = size;
+                this.life = life;
+                this.maxLife = life;
+                this.gravity = 0.3;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.vy += this.gravity;
+                this.vx = 0.98;
+                this.life--;
+                this.size = 0.97;
+            }
+
+            draw(ctx) {
+                const alpha = this.life / this.maxLife;
+                ctx.save();
+                ctx.globalAlpha = alpha;
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI  2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            isDead() {
+                return this.life <= 0 || this.size < 0.5;
+            }
+        }
+
+        class ParticleSystem {
+            constructor() {
+                this.particles = [];
+            }
+
+            emit(x, y, count, color, spread = 5, sizeRange = [3, 8], lifeRange = [20, 40]) {
+                for (let i = 0; i < count; i++) {
+                    const angle = Math.random()  Math.PI  2;
+                    const speed = Math.random()  spread + 2;
+                    const vx = Math.cos(angle)  speed;
+                    const vy = Math.sin(angle)  speed - 3;
+                    const size = Math.random()  (sizeRange[1] - sizeRange[0]) + sizeRange[0];
+                    const life = Math.random()  (lifeRange[1] - lifeRange[0]) + lifeRange[0];
+                    this.particles.push(new Particle(x, y, color, vx, vy, size, life));
+                }
+            }
+
+            emitSpark(x, y, direction) {
+                const colors = ['#ff6633', '#ffaa00', '#ff3300', '#ffffff'];
+                for (let i = 0; i < 8; i++) {
+                    const color = colors[Math.floor(Math.random()  colors.length)];
+                    const angle = (Math.random() - 0.5)  Math.PI  0.5 + (direction > 0 ? 0 : Math.PI);
+                    const speed = Math.random()  8 + 4;
+                    const vx = Math.cos(angle)  speed;
+                    const vy = Math.sin(angle)  speed - 2;
+                    this.particles.push(new Particle(x, y, color, vx, vy, Math.random()  4 + 2, 25));
+                }
+            }
+
+            update() {
+                this.particles = this.particles.filter(p => {
+                    p.update();
+                    return !p.isDead();
+                });
+            }
+
+            draw(ctx) {
+                this.particles.forEach(p => p.draw(ctx));
+            }
+        }
+
+        // ==================== KÄMPFER KLASSE ====================
+        class Fighter {
+            constructor(x, facingRight, isPlayer = false) {
+                this.x = x;
+                this.y = CONFIG.GROUNDY;
+                this.vx = 0;
+                this.vy = 0;
+                this.width = 60;
+                this.height = 120;
+                this.facingRight = facingRight;
+                this.isPlayer = isPlayer;
+                
+                this.maxHealth = 100;
+                this.health = this.maxHealth;
+                
+                this.state = 'idle';
+                this.stateTimer = 0;
+                this.stunTimer = 0;
+                this.isGrounded = true;
+                this.isBlocking = false;
+                this.isDucking = false;
+                
+                this.lightCooldown = 0;
+                this.heavyCooldown = 0;
+                
+                this.animFrame = 0;
+                this.animTimer = 0;
+                
+                this.attackHitbox = null;
+                this.hasHitThisAttack = false;
+                
+                this.limbPositions = {
+                    headY: 0,
+                    bodyY: 0,
+                    armAngle: 0,
+                    legAngle: 0,
+                    kickLegAngle: 0
+                };
+            }
+
+            get hitbox() {
+                const h = this.isDucking ? this.height  0.5 : this.height;
+                const yOffset = this.isDucking ? this.height  0.5 : 0;
+                return {
+                    x: this.x - this.width / 2,
+                    y: this.y - h + yOffset,
+                    width: this.width,
+                    height: h
+                };
+            }
+
+            takeDamage(amount, knockback, attacker, isCrit = false) {
+                if (this.isBlocking) {
+                    amount = CONFIG.BLOCKREDUCTION;
+                    knockback = 0.3;
+                }
+                
+                this.health = Math.max(0, this.health - amount);
+                this.vx = this.x < attacker.x ? -knockback : knockback;
+                this.vy = -3;
+                
+                if (!this.isBlocking) {
+                    this.stunTimer = CONFIG.HITSTUN;
+                    this.state = 'hurt';
+                    this.stateTimer = 15;
+                }
+                
+                return { blocked: this.isBlocking, crit: isCrit };
+            }
+
+            lightAttack() {
+                if (this.lightCooldown > 0 || this.stunTimer > 0 || !this.isGrounded || this.state === 'attack') return false;
+                
+                this.state = 'attack';
+                this.stateTimer = 20;
+                this.lightCooldown = 25;
+                this.hasHitThisAttack = false;
+                
+                const reach = 70;
+                const offsetX = this.facingRight ? this.width / 2 : -this.width / 2 - reach;
+                this.attackHitbox = {
+                    x: this.x + offsetX,
+                    y: this.y - this.height  0.6,
+                    width: reach,
+                    height: 40,
+                    damage: CONFIG.LIGHTDAMAGE,
+                    knockback: CONFIG.KNOCKBACKLIGHT,
+                    isHeavy: false
+                };
+                
+                setTimeout(() => { this.attackHitbox = null; }, 150);
+                return true;
+            }
+
+            heavyAttack() {
+                if (this.heavyCooldown > 0 || this.stunTimer > 0 || !this.isGrounded || this.state === 'attack') return false;
+                
+                this.state = 'attack';
+                this.stateTimer = 35;
+                this.heavyCooldown = 50;
+                this.hasHitThisAttack = false;
+                
+                const reach = 90;
+                const offsetX = this.facingRight ? this.width / 2 : -this.width / 2 - reach;
+                
+                setTimeout(() => {
+                    if (this.state === 'attack') {
+                        this.attackHitbox = {
+                            x: this.x + offsetX,
+                            y: this.y - this.height  0.5,
+                            width: reach,
+                            height: 50,
+                            damage: CONFIG.HEAVYDAMAGE,
+                            knockback: CONFIG.KNOCKBACKHEAVY,
+                            isHeavy: true
+                        };
+                        setTimeout(() => { this.attackHitbox = null; }, 180);
+                    }
+                }, 150);
+                
+                return true;
+            }
+
+            update(keys, opponent) {
+                if (this.lightCooldown > 0) this.lightCooldown--;
+                if (this.heavyCooldown > 0) this.heavyCooldown--;
+                if (this.stunTimer > 0) this.stunTimer--;
+                if (this.stateTimer > 0) this.stateTimer--;
+                
+                if (this.stateTimer <= 0 && (this.state === 'attack' || this.state === 'hurt')) {
+                    this.state = 'idle';
+                }
+                
+                this.isBlocking = false;
+                this.isDucking = false;
+                
+                if (this.isPlayer && this.stunTimer <= 0) {
+                    if (keys['KeyL'] && this.isGrounded && this.state !== 'attack') {
+                        this.isBlocking = true;
+                        this.state = 'block';
+                    }
+                    
+                    if (keys['KeyS'] && this.isGrounded && !this.isBlocking) {
+                        this.isDucking = true;
+                    }
+                    
+                    if (!this.isBlocking && this.state !== 'attack') {
+                        if (keys['KeyA']) {
+                            this.vx = -CONFIG.PLAYERSPEED;
+                            if (this.isGrounded) this.state = 'walk';
+                        } else if (keys['KeyD']) {
+                            this.vx = CONFIG.PLAYERSPEED;
+                            if (this.isGrounded) this.state = 'walk';
+                        }
+                        
+                        if (keys['KeyW'] && this.isGrounded) {
+                            this.vy = CONFIG.JUMPFORCE;
+                            this.isGrounded = false;
+                            this.state = 'jump';
+                        }
+                    }
+                }
+                
+                if (opponent) {
+                    this.facingRight = this.x < opponent.x;
+                }
+                
+                this.vy += CONFIG.GRAVITY;
+                this.x += this.vx;
+                this.y += this.vy;
+                this.vx = CONFIG.FRICTION;
+                
+                if (this.y >= CONFIG.GROUNDY) {
+                    this.y = CONFIG.GROUNDY;
+                    this.vy = 0;
+                    this.isGrounded = true;
+                    if (this.state === 'jump') this.state = 'idle';
+                }
+                
+                this.x = Math.max(50, Math.min(CONFIG.WIDTH - 50, this.x));
+                
+                if (this.isGrounded && Math.abs(this.vx) < 0.5 && this.state === 'walk') {
+                    this.state = 'idle';
+                }
+                
+                this.animTimer++;
+                if (this.animTimer >= 6) {
+                    this.animTimer = 0;
+                    this.animFrame = (this.animFrame + 1) % 8;
+                }
+                
+                this.updateLimbPositions();
+            }
+
+            updateLimbPositions() {
+                const t = this.animFrame / 8;
+                const bounce = Math.sin(t  Math.PI  2);
+                
+                switch (this.state) {
+                    case 'idle':
+                        this.limbPositions.headY = bounce  2;
+                        this.limbPositions.armAngle = bounce  0.1;
+                        this.limbPositions.legAngle = 0;
+                        break;
+                    case 'walk':
+                        this.limbPositions.headY = Math.abs(bounce)  3;
+                        this.limbPositions.armAngle = bounce  0.5;
+                        this.limbPositions.legAngle = bounce  0.6;
+                        break;
+                    case 'jump':
+                        this.limbPositions.headY = -5;
+                        this.limbPositions.armAngle = -0.8;
+                        this.limbPositions.legAngle = 0.4;
+                        break;
+                    case 'attack':
+                        const attackProgress = 1 - (this.stateTimer / (this.heavyCooldown > 40 ? 35 : 20));
+                        this.limbPositions.armAngle = this.facingRight ? 
+                            Math.sin(attackProgress  Math.PI)  2 : 
+                            -Math.sin(attackProgress  Math.PI)  2;
+                        this.limbPositions.kickLegAngle = this.heavyCooldown > 40 ? 
+                            Math.sin(attackProgress  Math.PI)  1.5 : 0;
+                        break;
+                    case 'hurt':
+                        this.limbPositions.headY = 5;
+                        this.limbPositions.armAngle = -0.3;
+                        break;
+                    case 'block':
+                        this.limbPositions.armAngle = this.facingRight ? 1.2 : -1.2;
+                        break;
+                }
+            }
+
+            draw(ctx) {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                
+                if (!this.facingRight) {
+                    ctx.scale(-1, 1);
+                }
+                
+                const color = this.isPlayer ? '#1a1a1a' : '#0d0d0d';
+                const outlineColor = this.isPlayer ? '#ff6633' : '#6633ff';
+                
+                ctx.fillStyle = color;
+                ctx.strokeStyle = outlineColor;
+                ctx.lineWidth = 2;
+                
+                const duckScale = this.isDucking ? 0.6 : 1;
+                const duckOffset = this.isDucking ? this.height  0.4 : 0;
+                
+                // Beine
+                ctx.save();
+                ctx.translate(-15, duckOffset - 40);
+                ctx.rotate(this.limbPositions.legAngle);
+                ctx.fillRect(-8, 0, 16, 50  duckScale);
+                ctx.strokeRect(-8, 0, 16, 50  duckScale);
+                ctx.restore();
+                
+                ctx.save();
+                ctx.translate(15, duckOffset - 40);
+                ctx.rotate(-this.limbPositions.legAngle + this.limbPositions.kickLegAngle);
+                ctx.fillRect(-8, 0, 16, 50  duckScale);
+                ctx.strokeRect(-8, 0, 16, 50  duckScale);
+                ctx.restore();
+                
+                // Körper
+                ctx.fillRect(-20, duckOffset - 90, 40, 55  duckScale);
+                ctx.strokeRect(-20, duckOffset - 90, 40, 55  duckScale);
+                
+                // Arme
+                ctx.save();
+                ctx.translate(25, duckOffset - 80);
+                ctx.rotate(this.limbPositions.armAngle);
+                ctx.fillRect(-6, 0, 12, 45);
+                ctx.strokeRect(-6, 0, 12, 45);
+                ctx.restore();
+                
+                ctx.save();
+                ctx.translate(-25, duckOffset - 80);
+                ctx.rotate(-this.limbPositions.armAngle  0.5);
+                ctx.fillRect(-6, 0, 12, 45);
+                ctx.strokeRect(-6, 0, 12, 45);
+                ctx.restore();
+                
+                // Kopf
+                const headY = duckOffset - 110 + this.limbPositions.headY;
+                ctx.beginPath();
+                ctx.arc(0, headY, 22, 0, Math.PI  2);
+                ctx.fill();
+                ctx.stroke();
+                
+                // Augen
+                ctx.fillStyle = outlineColor;
+                ctx.beginPath();
+                ctx.arc(8, headY - 3, 4, 0, Math.PI  2);
+                ctx.fill();
+                
+                ctx.restore();
+            }
+        }
+
+        // ==================== KI GEGNER ====================
+        class AIController {
+            constructor(fighter, difficulty = 1) {
+                this.fighter = fighter;
+                this.difficulty = difficulty;
+                this.decisionTimer = 0;
+                this.currentAction = 'approach';
+                this.reactionDelay = Math.max(5, 20 - difficulty  3);
+            }
+
+            update(player) {
+                if (this.fighter.stunTimer > 0 || this.fighter.health <= 0) return;
+                
+                this.decisionTimer--;
+                
+                const distance = Math.abs(this.fighter.x - player.x);
+                const facingPlayer = (this.fighter.x < player.x) === this.fighter.facingRight;
+                
+                if (this.decisionTimer <= 0) {
+                    this.decisionTimer = this.reactionDelay + Math.random()  15;
+                    
+                    if (player.state === 'attack' && Math.random() < 0.3 + this.difficulty  0.1) {
+                        this.currentAction = 'block';
+                    } else if (distance < 100 && Math.random() < 0.4) {
+                        this.currentAction = Math.random() < 0.6 ? 'lightAttack' : 'heavyAttack';
+                    } else if (distance < 80 && Math.random() < 0.25) {
+                        this.currentAction = 'retreat';
+                    } else if (distance > 150) {
+                        this.currentAction = 'approach';
+                    } else {
+                        this.currentAction = Math.random() < 0.5 ? 'approach' : 'wait';
+                    }
+                }
+                
+                this.fighter.isBlocking = false;
+                
+                switch (this.currentAction) {
+                    case 'approach':
+                        if (distance > 80) {
+                            this.fighter.vx = player.x > this.fighter.x ? 
+                                CONFIG.PLAYERSPEED  0.7 : -CONFIG.PLAYERSPEED  0.7;
+                            this.fighter.state = 'walk';
+                        }
+                        break;
+                        
+                    case 'retreat':
+                        this.fighter.vx = player.x > this.fighter.x ? 
+                            -CONFIG.PLAYERSPEED  0.8 : CONFIG.PLAYERSPEED  0.8;
+                        this.fighter.state = 'walk';
+                        if (Math.random() < 0.1 && this.fighter.isGrounded) {
+                            this.fighter.vy = CONFIG.JUMPFORCE  0.7;
+                            this.fighter.isGrounded = false;
+                        }
+                        break;
+                        
+                    case 'lightAttack':
+                        if (distance < 100 && facingPlayer) {
+                            this.fighter.lightAttack();
+                        }
+                        break;
+                        
+                    case 'heavyAttack':
+                        if (distance < 120 && facingPlayer) {
+                            this.fighter.heavyAttack();
+                        }
+                        break;
+                        
+                    case 'block':
+                        this.fighter.isBlocking = true;
+                        this.fighter.state = 'block';
+                        break;
+                        
+                    case 'wait':
+                        break;
+                }
+            }
+
+            increaseDifficulty() {
+                this.difficulty = Math.min(10, this.difficulty + 0.5);
+                this.reactionDelay = Math.max(5, 20 - this.difficulty  3);
+            }
+        }
+
+        // ==================== HAUPTSPIEL ====================
+        class Game {
+            constructor() {
+                this.canvas = document.getElementById('gameCanvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.canvas.width = CONFIG.WIDTH;
+                this.canvas.height = CONFIG.HEIGHT;
+                
+                this.audio = new AudioManager();
+                this.particles = new ParticleSystem();
+                
+                this.keys = {};
+                this.gameState = 'intro';
+                this.introTimer = 120;
+                this.introZoom = 1.3;
+                
+                this.screenShake = { x: 0, y: 0, timer: 0 };
+                this.freezeFrames = 0;
+                
+                this.message = '';
+                this.messageTimer = 0;
+                
+                this.parallaxLayers = this.createParallaxLayers();
+                this.aiDifficulty = 1;
+                
+                this.init();
+                this.setupInput();
+                this.gameLoop();
+            }
+
+            createParallaxLayers() {
+                const layers = [];
+                
+                // Hintergrundberge
+                layers.push({
+                    speed: 0.1,
+                    elements: Array(5).fill(0).map((, i) => ({
+                        x: i  250,
+                        width: 200 + Math.random()  100,
+                        height: 150 + Math.random()  100
+                    }))
+                });
+                
+                // Mittelgrund
+                layers.push({
+                    speed: 0.3,
+                    elements: Array(8).fill(0).map((, i) => ({
+                        x: i  150,
+                        width: 80 + Math.random()  60,
+                        height: 80 + Math.random()  60
+                    }))
+                });
+                
+                return layers;
+            }
+
+            init() {
+                this.player = new Fighter(200, true, true);
+                this.enemy = new Fighter(800, false, false);
+                this.ai = new AIController(this.enemy, this.aiDifficulty);
+                this.particles.particles = [];
+            }
+
+            setupInput() {
+                window.addEventListener('keydown', (e) => {
+                    this.keys[e.code] = true;
+                    
+                    if (e.code === 'KeyJ' && this.gameState === 'playing') {
+                        if (this.player.lightAttack()) {
+                            this.audio.playWhoosh();
+                        }
+                    }
+                    if (e.code === 'KeyK' && this.gameState === 'playing') {
+                        if (this.player.heavyAttack()) {
+                            this.audio.playWhoosh();
+                        }
+                    }
+                    if (e.code === 'Space' && this.gameState === 'gameover') {
+                        this.restart();
+                    }
+                    
+                    // Audio Context aktivieren
+                    if (this.audio.ctx.state === 'suspended') {
+                        this.audio.ctx.resume();
+                    }
+                });
+                
+                window.addEventListener('keyup', (e) => {
+                    this.keys[e.code] = false;
+                });
+            }
+
+            restart() {
+                if (this.player.health > 0) {
+                    this.aiDifficulty = Math.min(10, this.aiDifficulty + 0.5);
+                } else {
+                    this.aiDifficulty = 1;
+                }
+                this.init();
+                this.gameState = 'intro';
+                this.introTimer = 90;
+                this.introZoom = 1.2;
+            }
+
+            checkHit(attacker, defender) {
+                if (!attacker.attackHitbox || attacker.hasHitThisAttack) return false;
+                
+                const hb = attacker.attackHitbox;
+                const db = defender.hitbox;
+                
+                if (hb.x < db.x + db.width &&
+                    hb.x + hb.width > db.x &&
+                    hb.y < db.y + db.height &&
+                    hb.y + hb.height > db.y) {
+                    
+                    const isCrit = Math.random() < CONFIG.CRITCHANCE;
+                    const damage = hb.damage  (isCrit ? CONFIG.CRITMULTIPLIER : 1);
+                    const result = defender.takeDamage(damage, hb.knockback, attacker, isCrit);
+                    
+                    attacker.hasHitThisAttack = true;
+                    
+                    // Effekte
+                    const hitX = (attacker.x + defender.x) / 2;
+                    const hitY = defender.y - defender.height  0.5;
+                    
+                    if (result.blocked) {
+                        this.audio.playBlock();
+                        this.particles.emit(hitX, hitY, 5, '#4488ff', 3);
+                    } else {
+                        this.audio.playHit(hb.isHeavy);
+                        
+                        const particleColor = isCrit ? '#ffff00' : (hb.isHeavy ? '#ff3300' : '#ff6633');
+                        this.particles.emit(hitX, hitY, isCrit ? 20 : 12, particleColor, 6);
+                        this.particles.emitSpark(hitX, hitY, attacker.facingRight ? 1 : -1);
+                        
+                        this.freezeFrames = hb.isHeavy ? CONFIG.FREEZEFRAMESHEAVY : CONFIG.FREEZEFRAMESLIGHT;
+                        
+                        if (hb.isHeavy || isCrit) {
+                            this.screenShake.timer = CONFIG.SHAKEDURATION;
+                        }
+                    }
+                    
+                    return true;
+                }
+                return false;
+            }
+
+            update() {
+                if (this.freezeFrames > 0) {
+                    this.freezeFrames--;
+                    return;
+                }
+                
+                if (this.screenShake.timer > 0) {
+                    this.screenShake.x = (Math.random() - 0.5)  CONFIG.SHAKEINTENSITY;
+                    this.screenShake.y = (Math.random() - 0.5)  CONFIG.SHAKEINTENSITY;
+                    this.screenShake.timer--;
+                } else {
+                    this.screenShake.x = 0;
+                    this.screenShake.y = 0;
+                }
+                
+                if (this.messageTimer > 0) {
+                    this.messageTimer--;
+                }
+                
+                this.particles.update();
+                
+                switch (this.gameState) {
+                    case 'intro':
+                        this.introTimer--;
+                        this.introZoom = 1 + (this.introTimer / 90)  0.2;
+                        
+                        if (this.introTimer === 60) {
+                            this.message = 'FIGHT!';
+                            this.messageTimer = 60;
+                        }
+                        
+                        if (this.introTimer <= 0) {
+                            this.gameState = 'playing';
+                        }
+                        break;
+                        
+                    case 'playing':
+                        this.player.update(this.keys, this.enemy);
+                        this.ai.update(this.player);
+                        this.enemy.update({}, this.player);
+                        
+                        this.checkHit(this.player, this.enemy);
+                        this.checkHit(this.enemy, this.player);
+                        
+                        if (this.player.health <= 0) {
+                            this.gameState = 'gameover';
+                            this.message = 'DEFEAT';
+                            this.messageTimer = 999;
+                            this.player.state = 'ko';
+                            this.audio.playKO();
+                        } else if (this.enemy.health <= 0) {
+                            this.gameState = 'gameover';
+                            this.message = 'VICTORY';
+                            this.messageTimer = 999;
+                            this.enemy.state = 'ko';
+                            this.audio.playVictory();
+                            this.ai.increaseDifficulty();
+                        }
+                        break;
+                }
+            }
+
+            drawParallax() {
+                const centerX = (this.player.x + this.enemy.x) / 2;
+                
+                // Himmel-Gradient
+                const gradient = this.ctx.createLinearGradient(0, 0, 0, CONFIG.HEIGHT);
+                gradient.addColorStop(0, '#1a0a0a');
+                gradient.addColorStop(0.5, '#2a1515');
+                gradient.addColorStop(1, '#3a2020');
+                this.ctx.fillStyle = gradient;
+                this.ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+                
+                // Parallax-Layer
+                this.parallaxLayers.forEach((layer, layerIndex) => {
+                    const offset = (centerX - CONFIG.WIDTH / 2)  layer.speed;
+                    const alpha = 0.3 - layerIndex  0.1;
+                    
+                    this.ctx.fillStyle = rgba(0, 0, 0, ${alpha});
+                    
+                    layer.elements.forEach(el => {
+                        const x = ((el.x - offset) % (CONFIG.WIDTH + 200)) - 100;
+                        this.ctx.beginPath();
+                        this.ctx.moveTo(x, CONFIG.GROUNDY);
+                        this.ctx.lineTo(x + el.width / 2, CONFIG.GROUNDY - el.height);
+                        this.ctx.lineTo(x + el.width, CONFIG.GROUNDY);
+                        this.ctx.fill();
+                    });
+                });
+                
+                // Boden
+                this.ctx.fillStyle = '#0a0505';
+                this.ctx.fillRect(0, CONFIG.GROUNDY, CONFIG.WIDTH, CONFIG.HEIGHT - CONFIG.GROUNDY);
+                
+                // Bodenlinie
+                this.ctx.strokeStyle = '#331111';
+                this.ctx.lineWidth = 2;
+                this.ctx.beginPath();
+                this.ctx.moveTo(0, CONFIG.GROUNDY);
+                this.ctx.lineTo(CONFIG.WIDTH, CONFIG.GROUNDY);
+                this.ctx.stroke();
+            }
+
+            drawHealthBar(x, y, width, health, maxHealth, isPlayer) {
+                const healthPercent = health / maxHealth;
+                const barHeight = 20;
+                
+                // Hintergrund
+                this.ctx.fillStyle = '#1a1a1a';
+                this.ctx.fillRect(x, y, width, barHeight);
+                
+                // Gesundheitsbalken
+                const healthWidth = width  healthPercent;
+                const gradient = this.ctx.createLinearGradient(x, y, x + healthWidth, y);
+                
+                if (isPlayer) {
+                    gradient.addColorStop(0, '#ff3300');
+                    gradient.addColorStop(1, '#ff6633');
+                } else {
+                    gradient.addColorStop(0, '#6600ff');
+                    gradient.addColorStop(1, '#9933ff');
+                }
+                
+                this.ctx.fillStyle = gradient;
+                this.ctx.fillRect(x, y, healthWidth, barHeight);
+                
+                // Rahmen
+                this.ctx.strokeStyle = '#444';
+                this.ctx.lineWidth = 2;
+                this.ctx.strokeRect(x, y, width, barHeight);
+                
+                // Trennlinien
+                this.ctx.strokeStyle = '#333';
+                this.ctx.lineWidth = 1;
+                for (let i = 1; i < 10; i++) {
+                    const lineX = x + (width / 10)  i;
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(lineX, y);
+                    this.ctx.lineTo(lineX, y + barHeight);
+                    this.ctx.stroke();
+                }
+            }
+
+            drawCooldowns() {
+                const drawCooldown = (x, y, current, max, key, label) => {
+                    const size = 35;
+                    const progress = 1 - (current / max);
+                    
+                    this.ctx.fillStyle = '#1a1a1a';
+                    this.ctx.beginPath();
+                    this.ctx.arc(x, y, size / 2, 0, Math.PI  2);
+                    this.ctx.fill();
+                    
+                    if (progress < 1) {
+                        this.ctx.fillStyle = '#ff6633';
+                        this.ctx.beginPath();
+                        this.ctx.moveTo(x, y);
+                        this.ctx.arc(x, y, size / 2, -Math.PI / 2, -Math.PI / 2 + progress  Math.PI  2);
+                        this.ctx.fill();
+                    } else {
+                        this.ctx.fillStyle = '#ff6633';
+                        this.ctx.beginPath();
+                        this.ctx.arc(x, y, size / 2, 0, Math.PI  2);
+                        this.ctx.fill();
+                    }
+                    
+                    this.ctx.fillStyle = '#fff';
+                    this.ctx.font = 'bold 14px sans-serif';
+                    this.ctx.textAlign = 'center';
+                    this.ctx.fillText(key, x, y + 5);
+                };
+                
+                drawCooldown(50, CONFIG.HEIGHT - 40, this.player.lightCooldown, 25, 'J', 'Light');
+                drawCooldown(100, CONFIG.HEIGHT - 40, this.player.heavyCooldown, 50, 'K', 'Heavy');
+            }
+
+            drawMessage() {
+                if (this.messageTimer <= 0) return;
+                
+                const alpha = Math.min(1, this.messageTimer / 30);
+                const scale = 1 + (1 - alpha) * 0.5;
+                
+                this.ctx.save();
+                this.ctx.translate(CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2);
+                this.ctx.scale(scale, scale);
+                
+                this.ctx.fillStyle = rgba(255, 255, 255, ${alpha});
+                this.ctx.font = 'bold 80px sans-serif';
+                this.ctx.textAlign = 'center';
+                this.ctx.textBaseline = 'middle';
+                
+                // Schatten
+                this.ctx.shadowColor = this.message === 'VICTORY' ? '#ff6633' : 
+                                       this.message === 'DEFEAT' ? '#6633ff' : '#ffffff';
+                this.ctx.shadowBlur = 30;
+                
+                this.ctx.fillText(this.message, 0, 0);
+                
+                if (this.gameState === 'gameover') {
+                    this.ctx.font = '24px sans-serif';
+                    this.ctx.shadowBlur = 10;
+                    this.ctx.fillText('Drücke SPACE zum Neustarten', 0, 60);
+                }
+                
+                this.ctx.restore();
+            }
+
+            draw() {
+                this.ctx.save();
+                this.ctx.translate(this.screenShake.x, this.screenShake.y);
+                
+                if (this.gameState === 'intro') {
+                    this.ctx.translate(CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2);
+                    this.ctx.scale(this.introZoom, this.introZoom);
+                    this.ctx.translate(-CONFIG.WIDTH / 2, -CONFIG.HEIGHT / 2);
+                }
+                
+                this.drawParallax();
+                
+                this.player.draw(this.ctx);
+                this.enemy.draw(this.ctx);
+                
+                this.particles.draw(this.ctx);
+                
+                this.ctx.restore();
+                
+                // UI (nicht vom Shake betroffen)
+                this.drawHealthBar(20, 20, 300, this.player.health, this.player.maxHealth, true);
+                this.drawHealthBar(CONFIG.WIDTH - 320, 20, 300, this.enemy.health, this.enemy.maxHealth, false);
+                
+                // Namen
+                this.ctx.fillStyle = '#fff';
+                this.ctx.font = 'bold 16px sans-serif';
+                this.ctx.textAlign = 'left';
+                this.ctx.fillText('SPIELER', 20, 55);
+                this.ctx.textAlign = 'right';
+                this.ctx.fillText(GEGNER (Lv.${Math.floor(this.aiDifficulty)}), CONFIG.WIDTH - 20, 55);
+                
+                this.drawCooldowns();
+                this.drawMessage();
+            }
+
+            gameLoop() {
+                this.update();
+                this.draw();
+                requestAnimationFrame(() => this.gameLoop());
+            }
+        }
+
+        // Spiel starten
+        const game = new Game();
+    </script>
+</body>
+</html>
+``
